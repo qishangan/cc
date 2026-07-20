@@ -1,7 +1,9 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 
 import os
 import subprocess
+import json
+import ast
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -36,6 +38,8 @@ SYSTEM = (
     "Do not inspect secret files such as .env unless the user explicitly asks. "
     "For follow-up questions, answer from known context before using tools. "
     "Use tools when helpful, then answer the user directly."
+    "Before starting any multi-step task, use todo_write to plan your steps. "
+    "Update status as you go."
 )
 # ── Tool definition: just bash ────────────────────────────
 TOOLS = [
@@ -49,6 +53,8 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "glob", "description": "Find files matching a glob pattern.",
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {"name": "todo_write", "description": "Plan and track task progress. Pass the full updated todo list.",
+     "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
 ]
 
 
@@ -203,14 +209,53 @@ def run_glob(pattern: str) -> str:
     except Exception as e:
         return f"Error: {e}"
     
+CURRENT_TODOS = []
+def _normalize_todos(todos):
+    if isinstance(todos, str):
+        try:
+            todos = json.loads(todos)
+        except json.JSONDecodeError:
+            try:
+                todos = ast.literal_eval(todos)
+            except (SyntaxError, ValueError):
+                return None, "Error: todos must be a list or JSON array string"
+    if not isinstance(todos, list):
+        return None, "Error: todos must be a list"
+    for i, t in enumerate(todos):
+        if not isinstance(t, dict):
+            return None, f"Error: todos[{i}] must be an object"
+        if "content" not in t or "status" not in t:
+            return None, f"Error: todos[{i}] missing 'content' or 'status'"
+        if t["status"] not in ("pending", "in_progress", "completed"):
+            return None, f"Error: todos[{i}] has invalid status '{t['status']}'"
+    return todos, None
+def run_todo_write(todos: list) -> str:
+    global CURRENT_TODOS
+    todos, error = _normalize_todos(todos)
+    if error:
+        return error
+    CURRENT_TODOS = todos
+    lines = ["\n\033[33m## Current Tasks\033[0m"]
+    for t in CURRENT_TODOS:
+        icon = {"pending": " ", "in_progress": "\033[36m\u25b6\033[0m", "completed": "\033[32m\u2713\033[0m"}[t["status"]]
+        lines.append(f"  [{icon}] {t['content']}")
+    print("\n".join(lines))
+    return f"Updated {len(CURRENT_TODOS)} tasks"
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
-    "edit_file": run_edit, "glob": run_glob,
+    "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
 }
 
 # ── The core pattern: a while loop that calls tools until the model stops ──
+rounds_since_todo = 0
 def agent_loop(messages: list):
+    global rounds_since_todo
     while True:
+        # s05: nag reminder — inject if model hasn't updated todos for 3 rounds
+        if rounds_since_todo >= 3 and messages:
+            messages.append({"role": "user",
+                             "content": "<reminder>Update your todos.</reminder>"})
+            rounds_since_todo = 0
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
@@ -222,6 +267,7 @@ def agent_loop(messages: list):
                 messages.append({"role": "user", "content": force})
                 continue
             return
+        rounds_since_todo += 1
         results = []
         for block in response.content:
             if block.type != "tool_use":
@@ -235,6 +281,9 @@ def agent_loop(messages: list):
             handler = TOOL_HANDLERS.get(block.name)
             output = handler(**block.input) if handler else f"Unknown: {block.name}"
             trigger_hooks("PostToolUse", block, output)  # s04: post hook
+            # s05: reset nag counter when todo_write is called
+            if block.name == "todo_write":
+                rounds_since_todo = 0
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
         messages.append({"role": "user", "content": results})
 
