@@ -39,7 +39,15 @@ SYSTEM = (
     "For follow-up questions, answer from known context before using tools. "
     "Use tools when helpful, then answer the user directly."
     "Before starting any multi-step task, use todo_write to plan your steps. "
-    "Update status as you go."
+    "Update status as you go. "
+    "For complex sub-problems, use the task tool to spawn a subagent."
+)
+SUB_SYSTEM = (
+    f"You are a coding agent at {os.getcwd()}. Use {SHELL_NAME} commands to solve tasks. "
+    "Do not inspect secret files such as .env unless the user explicitly asks. "
+    "Complete the task you were given, then return a concise summary. "
+    "Do not modify files unless the task description asks you to. "
+    "Do not delegate further."
 )
 # ── Tool definition: just bash ────────────────────────────
 TOOLS = [
@@ -246,6 +254,77 @@ TOOL_HANDLERS = {
     "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
 }
 
+# ═══════════════════════════════════════════════════════════
+#  s06: Subagent — fresh messages[], summary only
+# ═══════════════════════════════════════════════════════════
+SUB_TOOL_NAMES = ("bash", "read_file", "write_file", "edit_file", "glob")
+SUB_TOOLS = [tool for tool in TOOLS if tool["name"] in SUB_TOOL_NAMES]
+SUB_HANDLERS = {name: TOOL_HANDLERS[name] for name in SUB_TOOL_NAMES}
+
+def extract_text(content) -> str:
+    """Extract text from Anthropic message content blocks."""
+    if not isinstance(content, list):
+        return str(content)
+    parts = []
+    for block in content:
+        if getattr(block, "type", None) == "text":
+            parts.append(getattr(block, "text", ""))
+        elif isinstance(block, dict) and block.get("type") == "text":
+            parts.append(str(block.get("text", "")))
+    return "\n".join(part for part in parts if part)
+
+def spawn_subagent(description: str) -> str:
+    """Spawn a subagent with fresh messages[], return summary only."""
+    print(f"\n\033[35m[Subagent spawned]\033[0m")
+    messages = [{"role": "user", "content": description}]
+    hit_limit = True
+    for _ in range(30):
+        response = client.messages.create(
+            model=MODEL, system=SUB_SYSTEM,
+            messages=messages, tools=SUB_TOOLS, max_tokens=8000,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            hit_limit = False
+            break
+        results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            blocked = trigger_hooks("PreToolUse", block)
+            if blocked:
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": str(blocked)})
+                continue
+            handler = SUB_HANDLERS.get(block.name)
+            output = handler(**block.input) if handler else f"Unknown: {block.name}"
+            trigger_hooks("PostToolUse", block, output)
+            print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
+            results.append({"type": "tool_result", "tool_use_id": block.id,
+                            "content": output})
+        messages.append({"role": "user", "content": results})
+
+    result = extract_text(messages[-1]["content"])
+    if hit_limit:
+        result = "Subagent stopped after 30 turns without final answer."
+    if not result:
+        for msg in reversed(messages):
+            if msg["role"] == "assistant":
+                result = extract_text(msg["content"])
+                if result:
+                    break
+        if not result:
+            result = "Subagent stopped after 30 turns without final answer."
+    print(f"\033[35m[Subagent done]\033[0m")
+    return result
+
+TOOLS.append({
+    "name": "task",
+    "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
+    "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]},
+})
+TOOL_HANDLERS["task"] = spawn_subagent
+
 # ── The core pattern: a while loop that calls tools until the model stops ──
 rounds_since_todo = 0
 def agent_loop(messages: list):
@@ -289,7 +368,7 @@ def agent_loop(messages: list):
 
 # ── Entry point ──────────────────────────────────────────
 if __name__ == "__main__":
-    print("agent: Tool Use")
+    print("agent: Tool Use + Subagent")
     print("输入问题，回车发送。输入 q 退出。\n")
     history = []
     while True:
