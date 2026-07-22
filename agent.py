@@ -5,6 +5,7 @@ import subprocess
 import json
 import ast
 
+import yaml
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from pathlib import Path
@@ -31,17 +32,69 @@ else:
     raise SystemExit("ANTHROPIC_AUTH_TYPE must be either 'bearer' or 'x-api-key'.")
 
 WORKDIR = Path.cwd()
+SKILLS_DIR = WORKDIR / "skills"
 MODEL = os.environ["MODEL_ID"]
 SHELL_NAME = "PowerShell" if os.name == "nt" else "bash"
-SYSTEM = (
-    f"You are a coding agent at {os.getcwd()}. Use {SHELL_NAME} commands to solve tasks. "
-    "Do not inspect secret files such as .env unless the user explicitly asks. "
-    "For follow-up questions, answer from known context before using tools. "
-    "Use tools when helpful, then answer the user directly."
-    "Before starting any multi-step task, use todo_write to plan your steps. "
-    "Update status as you go. "
-    "For complex sub-problems, use the task tool to spawn a subagent."
-)
+
+def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Parse YAML frontmatter from SKILL.md. Returns (meta, body)."""
+    if not text.startswith("---"):
+        return {}, text
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
+    try:
+        meta = yaml.safe_load(parts[1]) or {}
+    except yaml.YAMLError:
+        meta = {}
+    return meta, parts[2].strip()
+
+SKILL_REGISTRY: dict[str, dict] = {}
+def _scan_skills():
+    """Scan skills/ and populate the registry with each SKILL.md."""
+    if not SKILLS_DIR.exists():
+        return
+    for directory in sorted(SKILLS_DIR.iterdir()):
+        if not directory.is_dir():
+            continue
+        manifest = directory / "SKILL.md"
+        if manifest.exists():
+            raw = manifest.read_text(encoding="utf-8", errors="replace")
+            meta, _ = _parse_frontmatter(raw)
+            name = meta.get("name", directory.name)
+            description = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
+            SKILL_REGISTRY[name] = {
+                "name": name,
+                "description": description,
+                "content": raw,
+            }
+
+_scan_skills()
+
+def list_skills() -> str:
+    """List all available skills with their short descriptions."""
+    if not SKILL_REGISTRY:
+        return "(no skills found)"
+    return "\n".join(
+        f"- **{skill['name']}**: {skill['description']}"
+        for skill in SKILL_REGISTRY.values()
+    )
+
+def build_system() -> str:
+    """Build the system prompt with the lightweight skill catalog."""
+    return (
+        f"You are a coding agent at {os.getcwd()}. Use {SHELL_NAME} commands to solve tasks. "
+        "Do not inspect secret files such as .env unless the user explicitly asks. "
+        "For follow-up questions, answer from known context before using tools. "
+        "Use tools when helpful, then answer the user directly."
+        "Before starting any multi-step task, use todo_write to plan your steps. "
+        "Update status as you go. "
+        "For complex sub-problems, use the task tool to spawn a subagent."
+        f"\nSkills available:\n{list_skills()}\n"
+        "Use load_skill to get full details when needed."
+    )
+
+SYSTEM = build_system()
 SUB_SYSTEM = (
     f"You are a coding agent at {os.getcwd()}. Use {SHELL_NAME} commands to solve tasks. "
     "Do not inspect secret files such as .env unless the user explicitly asks. "
@@ -318,12 +371,25 @@ def spawn_subagent(description: str) -> str:
     print(f"\033[35m[Subagent done]\033[0m")
     return result
 
+def load_skill(name: str) -> str:
+    """Load full skill content by registered name."""
+    skill = SKILL_REGISTRY.get(name)
+    if not skill:
+        return f"Skill not found: {name}"
+    return skill["content"]
+
 TOOLS.append({
     "name": "task",
     "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
     "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]},
 })
 TOOL_HANDLERS["task"] = spawn_subagent
+TOOLS.append({
+    "name": "load_skill",
+    "description": "Load the full content of a skill by name.",
+    "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+})
+TOOL_HANDLERS["load_skill"] = load_skill
 
 # ── The core pattern: a while loop that calls tools until the model stops ──
 rounds_since_todo = 0
