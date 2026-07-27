@@ -6,6 +6,7 @@ import json
 import ast
 import time
 import re
+import random
 
 import yaml
 from anthropic import Anthropic
@@ -41,6 +42,7 @@ SKILLS_DIR = WORKDIR / "skills"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 MODEL = os.environ["MODEL_ID"]
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL_ID")
 SHELL_NAME = "PowerShell" if os.name == "nt" else "bash"
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -692,7 +694,94 @@ TOOL_HANDLERS["load_skill"] = load_skill
 CONTEXT_LIMIT = 50_000
 KEEP_RECENT = 3
 PERSIST_THRESHOLD = 30_000
-MAX_REACTIVE_RETRIES = 1
+DEFAULT_MAX_TOKENS = 8_000
+ESCALATED_MAX_TOKENS = 64_000
+MAX_RECOVERY_RETRIES = 3
+MAX_RETRIES = 10
+BASE_DELAY_MS = 500
+MAX_CONSECUTIVE_529 = 3
+CONTINUATION_PROMPT = (
+    "Output token limit hit. Resume directly - "
+    "no apology, no recap. Pick up mid-thought."
+)
+
+class RecoveryState:
+    """Track recovery attempts across one agent loop."""
+    def __init__(self):
+        self.has_escalated = False
+        self.recovery_count = 0
+        self.consecutive_529 = 0
+        self.has_attempted_reactive_compact = False
+        self.current_model = MODEL
+
+def retry_delay(attempt: int, retry_after: float | None = None) -> float:
+    """Return an exponential retry delay with jitter."""
+    if retry_after is not None:
+        return retry_after
+    base = min(BASE_DELAY_MS * (2 ** attempt), 32_000) / 1000
+    return base + random.uniform(0, base * 0.25)
+
+def get_retry_after(error: Exception) -> float | None:
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    try:
+        return max(0.0, float(headers.get("retry-after")))
+    except (TypeError, ValueError):
+        return None
+
+def with_retry(fn, state: RecoveryState):
+    """Retry rate-limit and overload errors; re-raise other failures."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            result = fn()
+            state.consecutive_529 = 0
+            return result
+        except Exception as error:
+            name = type(error).__name__.lower()
+            message = str(error).lower()
+            if "ratelimit" in name or "429" in message:
+                delay = retry_delay(attempt, get_retry_after(error))
+                print(
+                    f"  \033[33m[429 rate limit] retry {attempt + 1}/{MAX_RETRIES}, "
+                    f"wait {delay:.1f}s\033[0m"
+                )
+            elif "overloaded" in name or "529" in message or "overloaded" in message:
+                state.consecutive_529 += 1
+                if state.consecutive_529 >= MAX_CONSECUTIVE_529:
+                    if FALLBACK_MODEL:
+                        state.current_model = FALLBACK_MODEL
+                        print(
+                            f"  \033[31m[529 x{MAX_CONSECUTIVE_529}] "
+                            f"switching to {FALLBACK_MODEL}\033[0m"
+                        )
+                    else:
+                        print(
+                            f"  \033[31m[529 x{MAX_CONSECUTIVE_529}] "
+                            "no FALLBACK_MODEL_ID configured, continuing retry\033[0m"
+                        )
+                    state.consecutive_529 = 0
+                delay = retry_delay(attempt, get_retry_after(error))
+                print(
+                    f"  \033[33m[529 overloaded] retry {attempt + 1}/{MAX_RETRIES}, "
+                    f"wait {delay:.1f}s\033[0m"
+                )
+            else:
+                raise
+            if attempt + 1 < MAX_RETRIES:
+                time.sleep(delay)
+    raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded")
+
+def is_prompt_too_long_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return (
+        ("prompt" in message and "long" in message)
+        or "prompt_is_too_long" in message
+        or "context_length_exceeded" in message
+        or "max_context_window" in message
+        or "too many tokens" in message
+    )
 
 def estimate_size(messages: list) -> int:
     return len(str(messages))
@@ -836,7 +925,8 @@ TOOLS.append({
 rounds_since_todo = 0
 def agent_loop(messages: list, context: dict | None = None):
     global rounds_since_todo
-    reactive_retries = 0
+    state = RecoveryState()
+    max_tokens = DEFAULT_MAX_TOKENS
     context = update_context(context or {}, messages)
     system = get_system_prompt(context)
     memory_source = [
@@ -856,22 +946,52 @@ def agent_loop(messages: list, context: dict | None = None):
             print("[auto compact]")
             messages[:] = compact_history(messages)
         try:
-            response = client.messages.create(
-                model=MODEL, system=system, messages=messages,
-                tools=TOOLS, max_tokens=8000,
+            response = with_retry(
+                lambda: client.messages.create(
+                    model=state.current_model,
+                    system=system,
+                    messages=messages,
+                    tools=TOOLS,
+                    max_tokens=max_tokens,
+                ),
+                state,
             )
-            reactive_retries = 0
         except Exception as error:
-            prompt_too_long = (
-                "prompt_too_long" in str(error).lower()
-                or "too many tokens" in str(error).lower()
-            )
-            if prompt_too_long and reactive_retries < MAX_REACTIVE_RETRIES:
+            if is_prompt_too_long_error(error) and not state.has_attempted_reactive_compact:
                 print("[reactive compact]")
                 messages[:] = reactive_compact(messages)
-                reactive_retries += 1
+                state.has_attempted_reactive_compact = True
                 continue
-            raise
+            if is_prompt_too_long_error(error):
+                text = "[Error] Context too large, cannot continue."
+            else:
+                name = type(error).__name__
+                text = f"[Error] {name}: {str(error)[:200]}"
+            print(f"  \033[31m[unrecoverable] {text}\033[0m")
+            messages.append({"role": "assistant", "content": [
+                {"type": "text", "text": text}
+            ]})
+            return
+        if response.stop_reason == "max_tokens":
+            if not state.has_escalated:
+                max_tokens = ESCALATED_MAX_TOKENS
+                state.has_escalated = True
+                print(
+                    f"  \033[33m[max_tokens] escalating "
+                    f"{DEFAULT_MAX_TOKENS} -> {ESCALATED_MAX_TOKENS}\033[0m"
+                )
+                continue
+            messages.append({"role": "assistant", "content": response.content})
+            if state.recovery_count < MAX_RECOVERY_RETRIES:
+                messages.append({"role": "user", "content": CONTINUATION_PROMPT})
+                state.recovery_count += 1
+                print(
+                    f"  \033[33m[max_tokens] continuation "
+                    f"{state.recovery_count}/{MAX_RECOVERY_RETRIES}\033[0m"
+                )
+                continue
+            print("  \033[31m[max_tokens] recovery limit reached\033[0m")
+            return
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             force = trigger_hooks("Stop", messages)
