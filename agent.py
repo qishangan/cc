@@ -312,24 +312,85 @@ def consolidate_memories() -> None:
     except Exception:
         pass
 
-def build_system() -> str:
-    """Build the system prompt with lightweight skill and memory catalogs."""
-    memory_index = read_memory_index()
-    memory_catalog = f"\nMemories available:\n{memory_index}\n" if memory_index else ""
-    return (
-        f"You are a coding agent at {os.getcwd()}. Use {SHELL_NAME} commands to solve tasks. "
-        "Do not inspect secret files such as .env unless the user explicitly asks. "
+PROMPT_SECTIONS = {
+    "identity": "You are a coding agent. Use tools when helpful, then answer the user directly.",
+    "workspace": (
+        "Working directory: {workspace}. Use {shell_name} commands to solve tasks. "
+        "Do not inspect secret files such as .env unless the user explicitly asks."
+    ),
+    "tools": "Available tools: {enabled_tools}.",
+    "workflow": (
         "For follow-up questions, answer from known context before using tools. "
-        "Use tools when helpful, then answer the user directly."
         "Before starting any multi-step task, use todo_write to plan your steps. "
-        "Update status as you go. "
-        "For complex sub-problems, use the task tool to spawn a subagent."
-        f"\nSkills available:\n{list_skills()}\n"
+        "Update status as you go. For complex sub-problems, use the task tool to spawn a subagent."
+    ),
+    "skills": (
+        "Skills available:\n{skills}\n"
         "Use load_skill to get full details when needed."
-        f"{memory_catalog}"
+    ),
+    "memory": (
         "Relevant memories are provided in the system context when needed. "
         "Respect user preferences from memory."
-    )
+    ),
+}
+
+def assemble_system_prompt(context: dict) -> str:
+    """Select and join stable prompt sections from the current runtime context."""
+    sections = [
+        PROMPT_SECTIONS["identity"],
+        PROMPT_SECTIONS["workspace"].format(
+            workspace=context["workspace"], shell_name=SHELL_NAME
+        ),
+        PROMPT_SECTIONS["tools"].format(
+            enabled_tools=", ".join(context["enabled_tools"])
+        ),
+        PROMPT_SECTIONS["workflow"],
+        PROMPT_SECTIONS["skills"].format(skills=context["skills"]),
+    ]
+    memory_index = context.get("memory_index", "")
+    if memory_index:
+        sections.append(f"Memories available:\n{memory_index}")
+    memories = context.get("memories", "")
+    if memories:
+        sections.append(memories)
+    sections.append(PROMPT_SECTIONS["memory"])
+    return "\n\n".join(sections)
+
+_last_context_key = None
+_last_prompt = None
+
+def get_system_prompt(context: dict) -> str:
+    """Return a cached prompt when the runtime context has not changed."""
+    global _last_context_key, _last_prompt
+    key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
+    if key == _last_context_key and _last_prompt is not None:
+        print("  \033[90m[cache hit] system prompt unchanged\033[0m")
+        return _last_prompt
+    _last_context_key = key
+    _last_prompt = assemble_system_prompt(context)
+    loaded = ["identity", "workspace", "tools", "workflow", "skills"]
+    if context.get("memory_index"):
+        loaded.append("memory index")
+    if context.get("memories"):
+        loaded.append("relevant memories")
+    print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
+    return _last_prompt
+
+def update_context(context: dict, messages: list) -> dict:
+    """Refresh prompt inputs from tools, workspace, skills, and memory state."""
+    memory_index = read_memory_index()
+    memory_changed = memory_index != context.get("memory_index")
+    if memory_changed or "memories" not in context:
+        memories = load_memories(messages)
+    else:
+        memories = context["memories"]
+    return {
+        "enabled_tools": list(TOOL_HANDLERS.keys()),
+        "workspace": str(WORKDIR),
+        "skills": list_skills(),
+        "memory_index": memory_index,
+        "memories": memories,
+    }
 
 SUB_SYSTEM = (
     f"You are a coding agent at {os.getcwd()}. Use {SHELL_NAME} commands to solve tasks. "
@@ -773,11 +834,11 @@ TOOLS.append({
 
 # ── The core pattern: a while loop that calls tools until the model stops ──
 rounds_since_todo = 0
-def agent_loop(messages: list):
+def agent_loop(messages: list, context: dict | None = None):
     global rounds_since_todo
     reactive_retries = 0
-    memories_content = load_memories(messages)
-    system = build_system()
+    context = update_context(context or {}, messages)
+    system = get_system_prompt(context)
     memory_source = [
         {"role": message.get("role", "?"), "content": extract_text(message.get("content", ""))}
         for message in messages[-9:]
@@ -795,11 +856,8 @@ def agent_loop(messages: list):
             print("[auto compact]")
             messages[:] = compact_history(messages)
         try:
-            request_system = system
-            if memories_content:
-                request_system = f"{system}\n\n{memories_content}"
             response = client.messages.create(
-                model=MODEL, system=request_system, messages=messages,
+                model=MODEL, system=system, messages=messages,
                 tools=TOOLS, max_tokens=8000,
             )
             reactive_retries = 0
@@ -850,7 +908,11 @@ def agent_loop(messages: list):
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
         else:
             messages.append({"role": "user", "content": results})
+            context = update_context(context, messages)
+            system = get_system_prompt(context)
             continue
+        context = update_context(context, messages)
+        system = get_system_prompt(context)
 
 # ── Entry point ──────────────────────────────────────────
 if __name__ == "__main__":
