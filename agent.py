@@ -7,9 +7,10 @@ import ast
 import time
 import re
 import random
+from dataclasses import asdict, dataclass
 
 import yaml
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -24,15 +25,59 @@ if missing_env:
     )
 
 API_KEY = os.getenv("ANTHROPIC_API_KEY")
-BASE_URL = os.getenv("ANTHROPIC_BASE_URL") or None
-AUTH_TYPE = os.getenv("ANTHROPIC_AUTH_TYPE") or ("bearer" if BASE_URL else "x-api-key")
+BASE_URL = (os.getenv("ANTHROPIC_BASE_URL") or "").strip() or None
+# Proxies such as aihub.dog expose the Anthropic Messages API behind a
+# bearer-authenticated /v1 endpoint. Keep the official x-api-key default when
+# no proxy is configured, while allowing an explicit override for other gateways.
+AUTH_TYPE = (os.getenv("ANTHROPIC_AUTH_TYPE") or ("bearer" if BASE_URL else "x-api-key")).strip().lower()
 
-if AUTH_TYPE == "bearer":
-    client = Anthropic(auth_token=API_KEY, base_url=BASE_URL)
-elif AUTH_TYPE == "x-api-key":
-    client = Anthropic(api_key=API_KEY, base_url=BASE_URL)
-else:
-    raise SystemExit("ANTHROPIC_AUTH_TYPE must be either 'bearer' or 'x-api-key'.")
+_openai_client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+
+class _MessageResponse:
+    def __init__(self, response):
+        message = response.choices[0].message
+        self.content = []
+        if message.content:
+            self.content.append(type("TextBlock", (), {"type": "text", "text": message.content})())
+        for call in (message.tool_calls or []):
+            args = json.loads(call.function.arguments or "{}")
+            self.content.append(type("ToolBlock", (), {
+                "type": "tool_use", "id": call.id,
+                "name": call.function.name, "input": args,
+            })())
+        self.stop_reason = "tool_use" if message.tool_calls else ("max_tokens" if response.choices[0].finish_reason == "length" else "end_turn")
+
+def _openai_messages(messages):
+    converted = []
+    for message in messages:
+        role, content = message.get("role"), message.get("content")
+        if role == "assistant" and isinstance(content, list):
+            text = "".join(getattr(block, "text", "") for block in content if getattr(block, "type", None) == "text")
+            calls = [{"id": block.id, "type": "function", "function": {"name": block.name, "arguments": json.dumps(block.input)}} for block in content if getattr(block, "type", None) == "tool_use"]
+            item = {"role": "assistant", "content": text or None}
+            if calls: item["tool_calls"] = calls
+            converted.append(item)
+        elif role == "user" and isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    converted.append({"role": "tool", "tool_call_id": block["tool_use_id"], "content": str(block.get("content", ""))})
+                else:
+                    converted.append({"role": "user", "content": str(block)})
+        else:
+            converted.append({"role": role, "content": content})
+    return converted
+
+class _Messages:
+    def create(self, *, model, messages, max_tokens, tools=None, system=None):
+        kwargs = {"model": model, "messages": ([{"role": "system", "content": system}] if system else []) + _openai_messages(messages), "max_tokens": max_tokens}
+        if tools:
+            kwargs["tools"] = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t["input_schema"]}} for t in tools if t["name"] != "compact"]
+        return _MessageResponse(_openai_client.chat.completions.create(**kwargs))
+
+class _CompatClient:
+    messages = _Messages()
+
+client = _CompatClient()
 
 WORKDIR = Path.cwd()
 MEMORY_DIR = WORKDIR / ".memory"
@@ -41,9 +86,116 @@ MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 SKILLS_DIR = WORKDIR / "skills"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
-MODEL = os.environ["MODEL_ID"]
+MODEL = os.environ["MODEL_ID"].strip()
+if not MODEL:
+    raise SystemExit("MODEL_ID must not be empty.")
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL_ID")
 SHELL_NAME = "PowerShell" if os.name == "nt" else "bash"
+
+# ── Persistent task graph ──────────────────────────────────────────────────
+# Tasks are deliberately file-backed so the main agent and subagents can share
+# state without relying on process-local globals.
+TASKS_DIR = WORKDIR / ".tasks"
+TASKS_DIR.mkdir(exist_ok=True)
+
+@dataclass
+class Task:
+    id: str
+    subject: str
+    description: str = ""
+    status: str = "pending"
+    owner: str | None = None
+    blockedBy: list[str] | None = None
+
+    def __post_init__(self):
+        self.blockedBy = list(self.blockedBy or [])
+
+def _task_path(task_id: str) -> Path:
+    if not re.fullmatch(r"task_[A-Za-z0-9_-]+", task_id):
+        raise ValueError("Invalid task id")
+    return TASKS_DIR / f"{task_id}.json"
+
+def _load_task(task_id: str) -> Task:
+    path = _task_path(task_id)
+    with path.open(encoding="utf-8") as stream:
+        data = json.load(stream)
+    return Task(**data)
+
+def _save_task(task: Task) -> None:
+    if task.status not in {"pending", "in_progress", "completed"}:
+        raise ValueError("Invalid task status")
+    path = _task_path(task.id)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(asdict(task), indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+def _all_tasks() -> list[Task]:
+    tasks = []
+    for path in sorted(TASKS_DIR.glob("task_*.json")):
+        try:
+            tasks.append(_load_task(path.stem))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+    return tasks
+
+def _task_dependencies_complete(task: Task) -> bool:
+    return all(
+        _task_path(dep).exists() and _load_task(dep).status == "completed"
+        for dep in task.blockedBy
+    )
+
+def run_create_task(subject: str, description: str = "", blockedBy: list[str] | None = None) -> str:
+    subject = str(subject).strip()
+    if not subject:
+        return "Error: subject must not be empty"
+    dependencies = list(blockedBy or [])
+    if len(set(dependencies)) != len(dependencies):
+        return "Error: blockedBy contains duplicate task ids"
+    for dep in dependencies:
+        try:
+            _load_task(dep)
+        except (FileNotFoundError, ValueError, json.JSONDecodeError):
+            return f"Error: dependency {dep} not found"
+    task = Task(f"task_{int(time.time())}_{random.randint(0, 9999):04d}", subject, str(description), blockedBy=dependencies)
+    _save_task(task)
+    return json.dumps(asdict(task), ensure_ascii=False)
+
+def run_list_tasks() -> str:
+    return json.dumps([asdict(task) for task in _all_tasks()], ensure_ascii=False, indent=2)
+
+def run_get_task(task_id: str) -> str:
+    try:
+        return json.dumps(asdict(_load_task(task_id)), ensure_ascii=False, indent=2)
+    except FileNotFoundError:
+        return f"Error: task {task_id} not found"
+    except ValueError as error:
+        return f"Error: {error}"
+
+def run_claim_task(task_id: str, owner: str = "agent") -> str:
+    try:
+        task = _load_task(task_id)
+    except (FileNotFoundError, ValueError) as error:
+        return f"Error: {error}" if isinstance(error, ValueError) else f"Error: task {task_id} not found"
+    if task.status != "pending":
+        return f"Error: task is already {task.status}"
+    if not _task_dependencies_complete(task):
+        return "Error: task is blocked by incomplete or missing dependencies"
+    task.owner = str(owner).strip() or "agent"
+    task.status = "in_progress"
+    _save_task(task)
+    return json.dumps(asdict(task), ensure_ascii=False)
+
+def run_complete_task(task_id: str) -> str:
+    try:
+        task = _load_task(task_id)
+    except (FileNotFoundError, ValueError) as error:
+        return f"Error: {error}" if isinstance(error, ValueError) else f"Error: task {task_id} not found"
+    if task.status != "in_progress":
+        return f"Error: task is {task.status}; claim it before completing"
+    task.status = "completed"
+    _save_task(task)
+    unblocked = [candidate.id for candidate in _all_tasks() if candidate.status == "pending" and _task_dependencies_complete(candidate)]
+    return json.dumps({"completed": asdict(task), "unblocked": unblocked}, ensure_ascii=False)
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
     """Parse YAML frontmatter from SKILL.md. Returns (meta, body)."""
@@ -415,6 +567,16 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
     {"name": "todo_write", "description": "Plan and track task progress. Pass the full updated todo list.",
      "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
+    {"name": "create_task", "description": "Create a persistent task with optional dependencies.",
+     "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}, "blockedBy": {"type": "array", "items": {"type": "string"}}}, "required": ["subject"]}},
+    {"name": "list_tasks", "description": "List all persistent tasks.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "get_task", "description": "Get a persistent task by id.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
+    {"name": "claim_task", "description": "Claim a pending task when all dependencies are complete.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}, "owner": {"type": "string"}}, "required": ["task_id"]}},
+    {"name": "complete_task", "description": "Complete an in-progress persistent task.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
 ]
 
 
@@ -604,6 +766,9 @@ def run_todo_write(todos: list) -> str:
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
+    "create_task": run_create_task, "list_tasks": run_list_tasks,
+    "get_task": run_get_task, "claim_task": run_claim_task,
+    "complete_task": run_complete_task,
 }
 
 # ═══════════════════════════════════════════════════════════
